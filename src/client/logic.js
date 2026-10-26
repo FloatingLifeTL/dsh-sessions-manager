@@ -563,6 +563,25 @@ export function aliveSessionCount(sessions, hiddenIds) {
   return seen === 0 ? null : alive
 }
 
+// 拖拽自动滚动：光标进入滚动容器上/下感应带时每帧该滚多少（负=向上，正=向下，0=不动）。
+// 纯数学，DOM 侧只负责取 rect 与 scrollTop，测试见 tests/client-logic.test.js。
+// - 感应带 = min(edge, max(minZone, height*0.25))：长列表用固定的 edge，矮容器按比例
+//   收窄，但不小于 minZone（否则列表只有几行时整块都是感应带，根本放不准）；
+// - 感应带再夹到 `height/2 - 1` 以内，保证任何容器都留得住中间的死区
+//   （否则 40px 高的列表悬停在正中也会滚）；
+// - 步长按「深入感应带的比例」线性加速，maxStep 封顶；光标在容器外直接取满速。
+export function dragAutoScrollStep({ y, top, bottom, edge = 64, maxStep = 20, minZone = 24 } = {}) {
+  const nums = [y, top, bottom, edge, maxStep, minZone].map(Number)
+  if (!nums.every((n) => Number.isFinite(n))) return 0
+  const height = bottom - top
+  if (!(height > 0) || !(maxStep > 0)) return 0
+  const zone = Math.min(edge, Math.max(minZone, height * 0.25), Math.max(0, height / 2 - 1))
+  if (!(zone > 0)) return 0
+  if (y < top + zone) return -Math.ceil(maxStep * Math.min(1, (top + zone - y) / zone))
+  if (y > bottom - zone) return Math.ceil(maxStep * Math.min(1, (y - (bottom - zone)) / zone))
+  return 0
+}
+
 // 把「还能出现几行」落到展开按钮上：
 // - `more` 未知（拿不到数据层）→ 一律不动作。DOM 兜底在数学上不成立
 //   （窗口内/外的隐藏数口径不同），宁可不改也不写一个看起来合理却会算错的数；

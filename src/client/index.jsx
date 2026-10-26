@@ -11,7 +11,7 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { aliveSessionCount, applyTagFilter, canDropOnWorkspace, collapsedVisibleTotal, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldOrphanSubagents, foldSubagents, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes } from './logic.js'
+import { aliveSessionCount, applyTagFilter, canDropOnWorkspace, collapsedVisibleTotal, countRenderedVisible, dotStateFor, dragAutoScrollStep, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldOrphanSubagents, foldSubagents, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes } from './logic.js'
 
 export const inject = ['slots']
 
@@ -4079,6 +4079,9 @@ function installSidebarStatusDots() {
 // The existing “移动会话” menu is also the keyboard-accessible fallback.
 // 同上：拖拽增强的观察器 / interval / document 级 pointerdown|drag* 监听器只装一份。
 let sidebarDragInstalled = false
+// 「当前拖的是一条会话行」——自动滚动只认这个状态。从 Finder 拖文件、拖选文本、
+// 拖图片进窗口同样会触发 dragover，那些绝不该把侧栏滚起来。
+let dsmSessionDragActive = false
 function installSidebarWorkspaceDrag() {
   if (typeof document === 'undefined') return
   if (sidebarDragInstalled) return
@@ -4151,6 +4154,7 @@ function installSidebarWorkspaceDrag() {
   }, true)
 
   document.addEventListener('dragstart', (event) => {
+    dsmSessionDragActive = false
     if (sidebarAdapter.disabled) return
     const moveCapability = dsmActionCapability('relocateSession') || dsmActionCapability('move')
     if (!moveCapability || !moveCapability.available) return
@@ -4158,6 +4162,7 @@ function installSidebarWorkspaceDrag() {
     const item = row && sessionForRow(row)
     if (!item || moving) return
     dragging = item
+    dsmSessionDragActive = true
     row.classList.add('dsm-drag-source')
   }, true)
   document.addEventListener('dragover', (event) => {
@@ -4201,12 +4206,14 @@ function installSidebarWorkspaceDrag() {
     } finally {
       moving = false
       dragging = null
+      dsmSessionDragActive = false
       row.classList.remove('dsm-drag-busy')
       decorateRows()
     }
   }, true)
   document.addEventListener('dragend', () => {
     dragging = null
+    dsmSessionDragActive = false
     clearVisuals()
   }, true)
 
@@ -4247,58 +4254,79 @@ function installSidebarWorkspaceDrag() {
 
 /**
  * 拖拽自动滚动：会话列表经常比侧栏高得多，把会话往列表顶端（或底端）拖时，
- * 视口外的工作区标题够不着。这里只观察原生 drag 事件、只滚侧栏里那个含
+ * 视口外的工作区标题够不着。这里只观察原生 drag 事件、只滚侧栏里那个
  * role="tree" 的滚动容器，不参与、也不改变 DSH 自己的拖放判定。
- * 装到 globalThis 上并带版本号：插件 HMR 会重建模块实例，重复安装会让
- * 滚动速度和监听器成倍叠加。
+ *
+ * 安装纪律（HMR 安全）：cordis 的 HMR 是「先 apply 新模块，再跑旧模块的
+ * cleanup」。按版本号 early-return 会让新实例误以为自己已经装好，紧接着旧
+ * cleanup 把监听器摘掉 —— 自动滚动从此永久失效。所以这里**无条件**摘掉上一代，
+ * 再用 token 认领自己这一份；cleanup 只在 token 还对得上时才动手。
  */
-const DRAG_AUTO_SCROLL_VERSION = 1
+const DRAG_AUTO_SCROLL_VERSION = 2
 const DRAG_AUTO_SCROLL_KEY = Symbol.for('dsh.sessions-manager.drag-auto-scroll')
 const DRAG_AUTO_SCROLL_EDGE = 64
 const DRAG_AUTO_SCROLL_MAX_STEP = 20
 const DRAG_AUTO_SCROLL_HOVER_SYNC_MS = 120
+// 侧栏外拖拽时不必每个 dragover 都重新上溯 DOM：容器没找到就按这个间隔重试。
+const DRAG_AUTO_SCROLL_RESOLVE_RETRY_MS = 120
 
 function installSidebarDragAutoScroll() {
-  if (typeof document === 'undefined' || typeof window === 'undefined') return
-  const current = globalThis[DRAG_AUTO_SCROLL_KEY]
-  if (current !== undefined && current.version === DRAG_AUTO_SCROLL_VERSION) return
-  if (current !== undefined && typeof current.dispose === 'function') current.dispose()
-  const state = { active: false, x: 0, y: 0, raf: 0, container: null, lastHoverSync: 0 }
-  const isSidebarList = (el) => el.getAttribute('role') === 'tree' || el.querySelector('[role="tree"]') !== null
-  const scrollableAncestor = (node) => {
+  if (typeof document === 'undefined' || typeof window === 'undefined') return null
+  const previous = globalThis[DRAG_AUTO_SCROLL_KEY]
+  if (previous && typeof previous.dispose === 'function') {
+    try { previous.dispose() } catch (error) { /* 上一代坏了也要继续装新的 */ }
+  }
+  const token = Symbol('dsm-drag-auto-scroll')
+  const state = { x: 0, y: 0, raf: 0, container: null, lastResolve: 0, lastHoverSync: 0, dataTransfer: null }
+  // 先读 role（属性，O(1)）再算样式：原先每个祖先都跑一次 querySelector，60 次/秒
+  // 的 dragover 在长侧栏上等于持续子树扫描。
+  const scrollableTreeAt = (node) => {
     let el = node instanceof Element ? node : null
     while (el !== null && el !== document.body && el !== document.documentElement) {
-      const overflowY = window.getComputedStyle(el).overflowY
-      if ((overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') && el.scrollHeight - el.clientHeight > 1 && isSidebarList(el)) return el
+      if (el.getAttribute('role') === 'tree') {
+        const overflowY = window.getComputedStyle(el).overflowY
+        if ((overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay')
+          && el.scrollHeight - el.clientHeight > 1) return el
+      }
       el = el.parentElement
     }
     return null
   }
-  const resolveContainer = (target) => {
-    const direct = scrollableAncestor(target)
-    if (direct !== null) return direct
-    // 光标停在列表上方（侧栏标题一带）时 target 已经不在列表里；只要水平位置
-    // 还在侧栏那一列，就仍然滚这个列表——和文件管理器把文件拖到面板顶端一致。
-    const tree = document.querySelector('[role="tree"]')
-    if (tree === null) return null
-    const rect = tree.getBoundingClientRect()
-    if (state.x < rect.left || state.x > rect.right) return null
-    return scrollableAncestor(tree)
+  // 光标停在列表上方（侧栏标题一带）时 target 已经不在列表里；挑「横向覆盖光标、
+  // 且最靠左」的那棵树——文档里可能还有别的 role="tree"（设置面板等），
+  // 盲取 querySelector 的第一个会滚错容器。
+  const sidebarTreeUnder = () => {
+    let best = null
+    let bestLeft = Infinity
+    document.querySelectorAll('[role="tree"]').forEach((el) => {
+      const rect = el.getBoundingClientRect()
+      if (rect.width <= 0) return
+      if (state.x < rect.left || state.x > rect.right) return
+      if (rect.left < bestLeft) { best = el; bestLeft = rect.left }
+    })
+    return best
   }
+  const resolveContainer = (target) => scrollableTreeAt(target) || scrollableTreeAt(sidebarTreeUnder())
   const speedAt = (container) => {
     const rect = container.getBoundingClientRect()
-    const zone = Math.min(DRAG_AUTO_SCROLL_EDGE, Math.max(24, rect.height * 0.25))
-    if (state.y < rect.top + zone) return -Math.ceil(DRAG_AUTO_SCROLL_MAX_STEP * Math.min(1, (rect.top + zone - state.y) / zone))
-    if (state.y > rect.bottom - zone) return Math.ceil(DRAG_AUTO_SCROLL_MAX_STEP * Math.min(1, (state.y - (rect.bottom - zone)) / zone))
-    return 0
+    return dragAutoScrollStep({
+      y: state.y,
+      top: rect.top,
+      bottom: rect.bottom,
+      edge: DRAG_AUTO_SCROLL_EDGE,
+      maxStep: DRAG_AUTO_SCROLL_MAX_STEP,
+    })
   }
   // 滚动之后光标下的行换了，浏览器不会补发 dragover；补一条合成事件，让目标
   // 高亮（本插件）与插入标记（DSH 原生排序）跟着滚动后的位置走。
+  // 必须复用真实拖拽的 dataTransfer：空 DataTransfer 没有 types，上游若按 types
+  // 判定「这是不是会话拖拽」，会把插入标记判成非拖拽，反而清掉高亮。
   const syncHover = () => {
+    if (!dsmSessionDragActive) return
     const now = Date.now()
     if (now - state.lastHoverSync < DRAG_AUTO_SCROLL_HOVER_SYNC_MS) return
     state.lastHoverSync = now
-    if (typeof DragEvent !== 'function' || typeof DataTransfer !== 'function') return
+    if (typeof DragEvent !== 'function' || !state.dataTransfer) return
     const target = document.elementFromPoint(state.x, state.y)
     if (target === null) return
     try {
@@ -4308,52 +4336,65 @@ function installSidebarDragAutoScroll() {
         composed: true,
         clientX: state.x,
         clientY: state.y,
-        dataTransfer: new DataTransfer(),
+        dataTransfer: state.dataTransfer,
       }))
     } catch (error) { /* 合成事件失败不影响滚动本身 */ }
   }
   const tick = () => {
     state.raf = 0
-    if (!state.active) return
     const container = state.container
-    if (container !== null && container.isConnected) {
-      const step = speedAt(container)
-      if (step !== 0) {
-        const before = container.scrollTop
-        container.scrollTop = before + step
-        if (container.scrollTop !== before) syncHover()
-      }
+    // 没有可滚容器就不必空转 rAF：下一次 dragover 会重新启动循环。
+    if (!dsmSessionDragActive || container === null || !container.isConnected) return
+    const step = speedAt(container)
+    if (step !== 0) {
+      const before = container.scrollTop
+      container.scrollTop = before + step
+      if (container.scrollTop !== before) syncHover()
     }
     state.raf = window.requestAnimationFrame(tick)
   }
   const stop = () => {
-    state.active = false
     state.container = null
+    state.lastResolve = 0
+    state.dataTransfer = null
     if (state.raf !== 0) window.cancelAnimationFrame(state.raf)
     state.raf = 0
   }
   const onDragOver = (event) => {
+    // 真实拖拽的 dataTransfer 只在事件期间有效，缓存给滚动后的合成 dragover 复用。
+    if (event.dataTransfer) state.dataTransfer = event.dataTransfer
+    if (!dsmSessionDragActive) { stop(); return }
     if (event.clientX === 0 && event.clientY === 0) return
     state.x = event.clientX
     state.y = event.clientY
-    state.active = true
-    if (state.container === null || !state.container.isConnected) state.container = resolveContainer(event.target instanceof Element ? event.target : null)
+    if (state.container === null || !state.container.isConnected) {
+      const target = event.target instanceof Element ? event.target : null
+      // 光标已经在列表行上（treeitem）时立刻解析，不必等重试窗口；只有在侧栏
+      // 之外拖着走时才节流，避免每帧上溯 DOM。
+      const insideList = target !== null && target.closest('[role="treeitem"]') !== null
+      const now = Date.now()
+      if (insideList || now - state.lastResolve >= DRAG_AUTO_SCROLL_RESOLVE_RETRY_MS) {
+        state.lastResolve = now
+        state.container = resolveContainer(target)
+      }
+    }
     if (state.container !== null && state.raf === 0) state.raf = window.requestAnimationFrame(tick)
   }
   document.addEventListener('dragover', onDragOver, true)
   document.addEventListener('dragend', stop, true)
   document.addEventListener('drop', stop, true)
   window.addEventListener('blur', stop)
-  globalThis[DRAG_AUTO_SCROLL_KEY] = {
-    version: DRAG_AUTO_SCROLL_VERSION,
-    dispose: () => {
-      document.removeEventListener('dragover', onDragOver, true)
-      document.removeEventListener('dragend', stop, true)
-      document.removeEventListener('drop', stop, true)
-      window.removeEventListener('blur', stop)
-      stop()
-    },
+  const dispose = () => {
+    document.removeEventListener('dragover', onDragOver, true)
+    document.removeEventListener('dragend', stop, true)
+    document.removeEventListener('drop', stop, true)
+    window.removeEventListener('blur', stop)
+    stop()
+    const current = globalThis[DRAG_AUTO_SCROLL_KEY]
+    if (current !== undefined && current.token === token) delete globalThis[DRAG_AUTO_SCROLL_KEY]
   }
+  globalThis[DRAG_AUTO_SCROLL_KEY] = { version: DRAG_AUTO_SCROLL_VERSION, token, dispose }
+  return dispose
 }
 
 export function apply(ctx) {
@@ -4380,14 +4421,12 @@ export function apply(ctx) {
   const disposeSidebarDots = installSidebarStatusDots()
   if (disposeSidebarDots) ctx.effect(() => disposeSidebarDots)
   installSidebarWorkspaceDrag()
-  installSidebarDragAutoScroll()
-  // 自动滚动只挂原生 drag 监听，同样要在插件停用/HMR 时摘干净，避免重复安装。
-  ctx.effect(() => () => {
-    const installed = globalThis[DRAG_AUTO_SCROLL_KEY]
-    if (installed === undefined || installed.version !== DRAG_AUTO_SCROLL_VERSION) return
-    installed.dispose()
-    delete globalThis[DRAG_AUTO_SCROLL_KEY]
-  })
+  // 拖拽自动滚动只挂原生 drag 监听，插件停用 / HMR 时靠返回的 disposer 摘干净。
+  // 不能写成 `ctx.effect(() => () => globalThis[key].dispose())`：HMR 时旧 cleanup
+  // 晚于新 apply 执行，按全局键摘除会连新一代的监听器一起摘掉（即 install 那段
+  // 注释里说的死锁）。
+  const disposeDragAutoScroll = installSidebarDragAutoScroll()
+  if (disposeDragAutoScroll) ctx.effect(() => disposeDragAutoScroll)
   const workspacesSvc = ctx.get('workspaces')
   ctx.slots.inject('settings.section', () =>
     ctx.slots.register(

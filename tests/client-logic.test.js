@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { aliveSessionCount, applyTagFilter, ascBranchTime, authoritativeTitleForFirstPaint, branchTimeKey, canDropOnWorkspace, collapsedVisibleTotal, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldOrphanSubagents, foldSubagents, moveNoticeText, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, TOAST_MAX_MS, TOAST_MIN_MS, toastDurationFor, workspaceForNodes } from '../src/client/logic.js'
+import { aliveSessionCount, applyTagFilter, ascBranchTime, authoritativeTitleForFirstPaint, branchTimeKey, canDropOnWorkspace, collapsedVisibleTotal, countRenderedVisible, dotStateFor, dragAutoScrollStep, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldOrphanSubagents, foldSubagents, moveNoticeText, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, TOAST_MAX_MS, TOAST_MIN_MS, toastDurationFor, workspaceForNodes } from '../src/client/logic.js'
 
 // ---- dotStateFor：状态点语义 ----------------------------------------------
 // 历史回归：DSH 把 running 报成 ongoing（9766476）；done 在当前行上不能亮绿
@@ -861,4 +861,42 @@ test('foldOrphanSubagents tolerates malformed input', () => {
   assert.deepEqual(foldOrphanSubagents([null, { nope: 1 }, { sessionId: 'x' }], null).rows.length, 3)
   // lineage 里没有对应条目 = 普通会话（保持原位），绝不误判成子代理。
   assert.deepEqual(foldOrphanSubagents([{ sessionId: 'x' }], {}).orphans, [])
+})
+
+test('dragAutoScrollStep ramps up inside the top and bottom edge bands', () => {
+  const box = { top: 100, bottom: 1100 } // 1000px 高的列表 → 感应带 64px
+  // 光标在容器上边界之外：满速向上，不会因为超出量无限放大。
+  assert.equal(dragAutoScrollStep({ y: -50, ...box }), -20)
+  // 感应带正中：半速（ceil(20 * 0.5)）。
+  assert.equal(dragAutoScrollStep({ y: 100 + 32, ...box }), -10)
+  // 刚进感应带：最慢一档。
+  assert.equal(dragAutoScrollStep({ y: 100 + 63, ...box }), -1)
+  // 中间死区：不动。
+  assert.equal(dragAutoScrollStep({ y: 600, ...box }), 0)
+  // 底部对称。
+  assert.equal(dragAutoScrollStep({ y: 1100 - 63, ...box }), 1)
+  assert.equal(dragAutoScrollStep({ y: 1100 - 32, ...box }), 10)
+  assert.equal(dragAutoScrollStep({ y: 1200, ...box }), 20)
+})
+
+test('dragAutoScrollStep keeps a dead zone even at the very top and bottom edges', () => {
+  const box = { top: 0, bottom: 1000 }
+  // 正好落在上边界 / 下边界上时方向唯一，不会两边同时命中。
+  assert.ok(dragAutoScrollStep({ y: 0, ...box }) < 0)
+  assert.ok(dragAutoScrollStep({ y: 1000, ...box }) > 0)
+  // 感应带不会超过容器高度的一半：矮容器（40px）中点仍然不动。
+  const short = { top: 200, bottom: 240 }
+  assert.equal(dragAutoScrollStep({ y: 220, ...short }), 0)
+  assert.ok(dragAutoScrollStep({ y: 200, ...short }) < 0)
+  assert.ok(dragAutoScrollStep({ y: 240, ...short }) > 0)
+})
+
+test('dragAutoScrollStep tolerates broken geometry and disabled limits', () => {
+  assert.equal(dragAutoScrollStep(), 0)
+  assert.equal(dragAutoScrollStep({ y: NaN, top: 0, bottom: 100 }), 0)
+  assert.equal(dragAutoScrollStep({ y: 10, top: 100, bottom: 0 }), 0) // 反向 rect
+  assert.equal(dragAutoScrollStep({ y: 10, top: 0, bottom: 100, maxStep: 0 }), 0)
+  assert.equal(dragAutoScrollStep({ y: 10, top: 0, bottom: 100, edge: 0 }), 0)
+  // maxStep 变小，满速跟着变小（常量是可调的）。
+  assert.equal(dragAutoScrollStep({ y: -50, top: 0, bottom: 100, maxStep: 6 }), -6)
 })
