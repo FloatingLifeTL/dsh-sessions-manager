@@ -2136,14 +2136,16 @@ function SessionPanel({ workspacesSvc }) {
               {selIds.length > 0 && (
                 <>
                   {filter === 'archived' && (
-                    <>
-                      <button type="button" className="archv-btn" disabled={busy !== null} onClick={() => doBatch('restore-many')}>恢复所选</button>
-                      <button type="button" className="archv-btn archv-del" disabled={busy !== null} onClick={() => doBatch('delete-many')}>{confirmBatch ? '确认删除所选?' : '删除所选'}</button>
-                    </>
+                    <button type="button" className="archv-btn" disabled={busy !== null} onClick={() => doBatch('restore-many')}>恢复所选</button>
                   )}
                   {filter !== 'archived' && (
                     <button type="button" className="archv-btn" disabled={busy !== null} onClick={() => doBatch('archive-many')}>归档所选</button>
                   )}
+                  {/* issue #18 复访：批量删除（移入回收站）原先只挂在「已归档」
+                      视图下，全部 / 活动 / 已收藏 / 空白视图多选后没有任何删除
+                      入口，与单条会话的「… → 移到回收站」不一致。各会话视图都给，
+                      回收站视图本身不走这个列表（showSessionList 已排除）。 */}
+                  <button type="button" className="archv-btn archv-del" disabled={busy !== null} title="移入回收站，可在回收站恢复" onClick={() => doBatch('delete-many')}>{confirmBatch ? '确认删除所选?' : '删除所选'}</button>
                   {canMove.available && (
                     <button
                       type="button"
